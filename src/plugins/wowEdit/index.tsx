@@ -6,6 +6,7 @@
 
 import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
 import { addMessagePreSendListener, MessageSendListener, removeMessagePreSendListener } from "@api/MessageEvents";
+import { Devs } from "@utils/constants";
 import definePlugin, { IconComponent } from "@utils/types";
 import { Message } from "@vencord/discord-types";
 import { MessageActions, MessageStore, Modal, openModal, SelectedChannelStore, TextArea, Toasts, UserStore, useState } from "@webpack/common";
@@ -249,7 +250,7 @@ function handleKeyDown(e: KeyboardEvent) {
 export default definePlugin({
     name: "WowEdit",
     description: "Set draft edit sebelum kirim pesan, lalu tekan Ctrl+X untuk trigger edit instan — seolah-olah kamu ngetik super cepat!",
-    authors: [{ name: "kintil555", id: 0n }],
+    authors: [Devs.kintil555],
     tags: ["edit", "fun", "prank"],
 
     chatBarButton: {
