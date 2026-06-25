@@ -159,14 +159,14 @@ function SlotCard({ slot, onChange }: { slot: GreetingSlot; onChange(patch: Part
 function SlotEditorList() {
     const { slots } = settings.use(["slots"]);
 
-    function patchSlot(key: string, patch: Partial<GreetingSlot>) {
-        settings.store.slots = slots.map(s => s.key === key ? { ...s, ...patch } : s);
+    function patchSlot(index: number, patch: Partial<GreetingSlot>) {
+        Object.assign(slots[index], patch);
     }
 
     return (
         <Flex flexDirection="column" gap="0.5em">
-            {slots.map(slot => (
-                <SlotCard key={slot.key} slot={slot} onChange={patch => patchSlot(slot.key, patch)} />
+            {slots.map((slot, index) => (
+                <SlotCard key={slot.key} slot={slot} onChange={patch => patchSlot(index, patch)} />
             ))}
         </Flex>
     );

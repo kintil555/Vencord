@@ -57,9 +57,7 @@ export async function sendGreetingForSlot(slotKey: string): Promise<SendResult> 
 
     const result = await doSend(slot.message, slot.label);
     if (result.ok) {
-        settings.store.slots = settings.store.slots.map(s =>
-            s.key === slotKey ? { ...s, lastSentDate: todayKey() } : s
-        );
+        slot.lastSentDate = todayKey();
     }
     return result;
 }
