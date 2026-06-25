@@ -1,0 +1,14 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2025 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+.vc-greeting-time-input {
+    background: var(--input-background, var(--background-secondary));
+    color: var(--text-default);
+    border: 1px solid var(--background-modifier-accent);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 0.875rem;
+}
