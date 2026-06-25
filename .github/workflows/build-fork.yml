@@ -1,0 +1,64 @@
+name: Build Fork (kintil555)
+
+on:
+    push:
+        branches:
+            - main
+        paths:
+            - .github/workflows/build-fork.yml
+            - src/**
+            - browser/**
+            - scripts/build/**
+            - package.json
+            - pnpm-lock.yaml
+    workflow_dispatch: # bisa trigger manual dari GitHub Actions tab
+
+env:
+    FORCE_COLOR: true
+
+jobs:
+    Build:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: pnpm/action-setup@v3
+
+            - name: Use Node.js 20
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: "pnpm"
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build desktop (standalone)
+              run: pnpm build --standalone
+
+            - name: Build web standalone
+              run: pnpm buildWebStandalone
+
+            - name: Generate plugin list
+              run: pnpm generatePluginJson dist/plugins.json dist/plugin-readmes.json
+
+            - name: Clean up unpacked dirs
+              run: |
+                  rm -rf dist/*-unpacked dist/vendor Vencord.user.css vencordDesktopRenderer.css vencordDesktopRenderer.css.map
+
+            - name: Upload build artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: vencord-fork-build-${{ github.sha }}
+                  path: dist/
+                  retention-days: 14
+
+            - name: Summary
+              run: |
+                  echo "## ✅ Build sukses!" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### File yang dihasilkan:" >> $GITHUB_STEP_SUMMARY
+                  ls dist/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
