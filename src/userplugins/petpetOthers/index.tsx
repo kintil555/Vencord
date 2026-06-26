@@ -8,8 +8,13 @@ import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import { makeLazy } from "@utils/lazy";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelStore, FluxDispatcher, GuildStore, UploadHandler, UserUtils } from "@webpack/common";
+import { CloudUpload as TCloudUpload } from "@vencord/discord-types";
+import { CloudUploadPlatform } from "@vencord/discord-types/enums";
+import { findLazy } from "@webpack";
+import { ChannelStore, Constants, FluxDispatcher, GuildStore, RestAPI, SnowflakeUtils, UserUtils } from "@webpack/common";
 import { GIFEncoder, nearestColorIndex, quantize } from "gifenc";
+
+const CloudUpload: typeof TCloudUpload = findLazy(m => m.prototype?.trackUploadFinished);
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -236,6 +241,47 @@ function parseTrigger(content: string, message: any): string | null {
     return null;
 }
 
+// ─── Auto Send ────────────────────────────────────────────────────────────────
+
+/**
+ * Upload file GIF dan langsung kirim ke channel tanpa popup konfirmasi.
+ * Menggunakan CloudUpload (sama seperti voiceMessages plugin) + RestAPI.post.
+ */
+function autoSendPetpet(file: File, channelId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const upload = new CloudUpload({
+            file,
+            isThumbnail: false,
+            platform: CloudUploadPlatform.WEB,
+        }, channelId);
+
+        upload.on("complete", () => {
+            RestAPI.post({
+                url: Constants.Endpoints.MESSAGES(channelId),
+                body: {
+                    channel_id: channelId,
+                    content: "",
+                    nonce: SnowflakeUtils.fromTimestamp(Date.now()),
+                    sticker_ids: [],
+                    type: 0,
+                    attachments: [{
+                        id: "0",
+                        filename: upload.filename,
+                        uploaded_filename: upload.uploadedFilename,
+                    }],
+                },
+            }).then(() => resolve()).catch(reject);
+        });
+
+        upload.on("error", () => {
+            logger.error("Gagal upload petpet GIF!");
+            reject(new Error("Upload failed"));
+        });
+
+        upload.upload();
+    });
+}
+
 // ─── Event Handler ────────────────────────────────────────────────────────────
 
 async function handleMessage({ message }: { message: any; }) {
@@ -281,21 +327,17 @@ async function handleMessage({ message }: { message: any; }) {
 
         // Tentukan channel tujuan
         const targetChannelId = resolveTargetChannel(message.channel_id);
-        const targetChannel = ChannelStore.getChannel(targetChannelId);
 
-        if (!targetChannel) {
-            logger.error(`Channel ${targetChannelId} tidak ditemukan!`);
+        if (!targetChannelId) {
+            logger.error("Channel tujuan tidak ditemukan!");
             return;
         }
 
         // Set cooldown sebelum upload (untuk cegah race condition)
         cooldownMap.set(userId, Date.now());
 
-        // Upload GIF ke channel tujuan
-        // setTimeout diperlukan karena Discord kadang clear state setelah event
-        setTimeout(() => {
-            UploadHandler.promptToUpload([gifFile], targetChannel, 0);
-        }, 10);
+        // Auto-upload & kirim langsung tanpa popup
+        await autoSendPetpet(gifFile, targetChannelId);
 
         logger.info(
             `Petpet GIF untuk user ${user.username} dikirim ke channel ${targetChannelId}!`
