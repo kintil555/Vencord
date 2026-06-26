@@ -11,7 +11,7 @@ import definePlugin, { OptionType } from "@utils/types";
 import { CloudUpload as TCloudUpload } from "@vencord/discord-types";
 import { CloudUploadPlatform } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
-import { ChannelStore, Constants, FluxDispatcher, GuildStore, RestAPI, SnowflakeUtils, UserUtils } from "@webpack/common";
+import { ChannelStore, Constants, FluxDispatcher, GuildStore, RestAPI, SnowflakeUtils, UserStore, UserUtils } from "@webpack/common";
 import { GIFEncoder, nearestColorIndex, quantize } from "gifenc";
 
 const CloudUpload: typeof TCloudUpload = findLazy(m => m.prototype?.trackUploadFinished);
@@ -25,7 +25,10 @@ const DEFAULT_DELAY = 20;
 const DEFAULT_RESOLUTION = 128;
 const FRAMES = 10;
 
-// ─── Petpet GIF Engine (sama persis dari plugin petpet resmi) ─────────────────
+/** Regex untuk Discord snowflake ID (17-19 digit) */
+const SNOWFLAKE_REGEX = /^\d{17,19}$/;
+
+// ─── Petpet GIF Engine ────────────────────────────────────────────────────────
 
 const getFrames = makeLazy(() =>
     Promise.all(
@@ -103,7 +106,6 @@ async function generatePetpetGif(avatarUrl: string): Promise<File> {
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
 
-    // Generate palette
     ctx.drawImage(avatar, 0, paletteImageSize, 0.8 * paletteImageSize, 0.8 * paletteImageSize);
     ctx.drawImage(frames[0], 0, 0, paletteImageSize, paletteImageSize);
     const { data: paletteData } = ctx.getImageData(0, 0, paletteImageSize, 2 * paletteImageSize);
@@ -144,6 +146,46 @@ async function generatePetpetGif(avatarUrl: string): Promise<File> {
     return new File([gif.bytesView()], "petpet.gif", { type: "image/gif" });
 }
 
+// ─── Avatar URL Builder ───────────────────────────────────────────────────────
+
+/**
+ * Bangun avatar URL langsung dari Discord CDN.
+ * Digunakan sebagai fallback jika user.getAvatarURL() tidak bisa dipanggil,
+ * atau sebagai cara mendapatkan avatar user luar server tanpa guild-specific hash.
+ *
+ * Format: https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=2048
+ * Untuk animated (hash diawali 'a_'): pakai .gif
+ */
+function buildCdnAvatarUrl(userId: string, avatarHash: string | null | undefined, canAnimate = true): string {
+    if (!avatarHash) {
+        // Default avatar: nomor discriminator % 5, atau modulo ID untuk new username system
+        const defaultIndex = (BigInt(userId) >> 22n) % 6n;
+        return `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+    }
+
+    const isAnimated = avatarHash.startsWith("a_");
+    const ext = isAnimated && canAnimate ? "gif" : "png";
+    return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.${ext}?size=2048`;
+}
+
+/**
+ * Dapatkan avatar URL terbaik untuk user:
+ * - Untuk user di guild yang sama: coba guild avatar dulu (server-specific pfp)
+ * - Untuk user luar server / guild tidak diketahui: pakai global avatar dari CDN
+ * - Fallback: default avatar Discord
+ */
+function getAvatarUrlForUser(user: any, guildId?: string | null): string {
+    // Kalau user punya method getAvatarURL (User object dari discord),
+    // pakai itu dengan guildId = undefined agar dapat global avatar (bukan guild-specific)
+    if (typeof user.getAvatarURL === "function") {
+        return user.getAvatarURL(guildId ?? undefined, 2048, true)
+            .replace(/\?size=\d+$/, "?size=2048");
+    }
+
+    // Fallback: bangun URL manual dari CDN
+    return buildCdnAvatarUrl(user.id, user.avatar, true);
+}
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 const settings = definePluginSettings({
@@ -165,7 +207,7 @@ const settings = definePluginSettings({
     },
     triggerWord: {
         type: OptionType.STRING,
-        description: "Kata trigger (default: !petpet). Format: !petpet @mention",
+        description: "Kata trigger (default: !petpet). Format: !petpet @mention / !petpet ID / !petpet username",
         default: "!petpet",
     },
     cooldownSeconds: {
@@ -173,34 +215,34 @@ const settings = definePluginSettings({
         description: "Cooldown antar petpet (detik) untuk mencegah spam.",
         default: 30,
     },
+    useGuildAvatar: {
+        type: OptionType.BOOLEAN,
+        description:
+            "Gunakan avatar server (guild-specific) jika tersedia. " +
+            "Nonaktifkan untuk selalu pakai avatar global dari CDN.",
+        default: true,
+    },
 });
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-/** Cooldown per user yang di-petpet (userId → timestamp terakhir) */
 const cooldownMap = new Map<string, number>();
-
-/** Sedang dalam proses generate (untuk mencegah double-trigger) */
 const processingSet = new Set<string>();
 
 // ─── Helper Functions ─────────────────────────────────────────────────────────
 
-/** Validasi bahwa channel tujuan ada dan accessible */
 function resolveTargetChannel(sourceChannelId: string): string | null {
     const configuredChannelId = settings.store.targetChannelId?.trim();
     const configuredGuildId = settings.store.targetGuildId?.trim();
 
-    // Kalau tidak dikonfigurasi, kirim ke channel yang sama
     if (!configuredChannelId) return sourceChannelId;
 
-    // Validasi channel ada
     const channel = ChannelStore.getChannel(configuredChannelId);
     if (!channel) {
         logger.warn(`Channel tujuan ${configuredChannelId} tidak ditemukan!`);
-        return sourceChannelId; // Fallback ke source channel
+        return sourceChannelId;
     }
 
-    // Validasi guild (opsional — hanya untuk logging)
     if (configuredGuildId) {
         const guild = GuildStore.getGuild(configuredGuildId);
         if (!guild) {
@@ -214,39 +256,77 @@ function resolveTargetChannel(sourceChannelId: string): string | null {
 }
 
 /**
- * Parse trigger dari pesan.
- * Format yang valid:
- *   !petpet @mention          (mention user yang di-reply atau mention langsung)
- *   !petpet <@123456789>      (mention dengan ID)
+ * Parse trigger dari pesan. Mendukung berbagai format:
  *
- * Mengembalikan userId jika trigger valid, null jika bukan trigger.
+ *   !petpet @mention            → mention user (harus di server ini)
+ *   !petpet <@123456789>        → mention dengan ID Discord
+ *   !petpet 123456789012345678  → ID user langsung (BISA dari luar server!)
+ *   !petpet username            → username (cari di cache lokal)
+ *   !petpet username#1234       → username + discriminator lama
+ *
+ * Mengembalikan { userId, isDirectId } atau null jika bukan trigger.
+ * isDirectId = true artinya user mungkin tidak di server ini → pakai CDN avatar global.
  */
-function parseTrigger(content: string, message: any): string | null {
+function parseTrigger(content: string, message: any): { userId: string; isOutsideServer: boolean; } | null {
     const trigger = (settings.store.triggerWord || TRIGGER_PREFIX).trim().toLowerCase();
-    const lower = content.trim().toLowerCase();
+    const trimmed = content.trim();
+    const lower = trimmed.toLowerCase();
 
     if (!lower.startsWith(trigger)) return null;
 
-    // Ekstrak user ID dari mention di konten pesan
-    const mentionMatch = content.match(/<@!?(\d+)>/);
-    if (mentionMatch) return mentionMatch[1];
+    // Ambil bagian setelah trigger word
+    const rest = trimmed.slice(trigger.length).trim();
 
-    // Kalau tidak ada mention eksplisit, pakai user yang di-reply
-    if (message.message_reference?.message_id) {
-        // User di-reply akan diambil dari referenced_message
+    if (!rest) {
+        // Tidak ada argumen — coba ambil dari reply
         const refAuthorId = message.referenced_message?.author?.id;
-        if (refAuthorId) return refAuthorId;
+        if (refAuthorId) return { userId: refAuthorId, isOutsideServer: false };
+        return null;
     }
 
+    // 1. Mention format: <@123456789> atau <@!123456789>
+    const mentionMatch = rest.match(/^<@!?(\d+)>$/);
+    if (mentionMatch) {
+        return { userId: mentionMatch[1], isOutsideServer: false };
+    }
+
+    // 2. ID langsung: 17-19 digit angka saja
+    if (SNOWFLAKE_REGEX.test(rest)) {
+        return { userId: rest, isOutsideServer: true };
+    }
+
+    // 3. username#discriminator (sistem lama)
+    const tagMatch = rest.match(/^(.+)#(\d{4})$/);
+    if (tagMatch) {
+        const [, uname, disc] = tagMatch;
+        const found = UserStore.findByTag(uname.trim(), disc);
+        if (found) {
+            logger.info(`Ditemukan user via tag: ${found.username}#${disc} (${found.id})`);
+            return { userId: found.id, isOutsideServer: false };
+        }
+        logger.warn(`User ${uname}#${disc} tidak ditemukan di cache lokal.`);
+        return null;
+    }
+
+    // 4. username saja (sistem baru — unique username tanpa #)
+    // Coba cari di UserStore lokal (hanya user yang pernah dilihat di Discord session ini)
+    const found = UserStore.findByTag(rest, null);
+    if (found) {
+        logger.info(`Ditemukan user via username: ${found.username} (${found.id})`);
+        return { userId: found.id, isOutsideServer: false };
+    }
+
+    // 5. Kalau tidak ketemu di cache, beri petunjuk ke user
+    logger.warn(
+        `"${rest}" tidak dikenali. ` +
+        `Gunakan format: !petpet @mention, !petpet <ID>, atau !petpet username. ` +
+        `Untuk user luar server, salin ID mereka (klik kanan → Copy User ID).`
+    );
     return null;
 }
 
 // ─── Auto Send ────────────────────────────────────────────────────────────────
 
-/**
- * Upload file GIF dan langsung kirim ke channel tanpa popup konfirmasi.
- * Menggunakan CloudUpload (sama seperti voiceMessages plugin) + RestAPI.post.
- */
 function autoSendPetpet(file: File, channelId: string): Promise<void> {
     return new Promise((resolve, reject) => {
         const upload = new CloudUpload({
@@ -287,10 +367,11 @@ function autoSendPetpet(file: File, channelId: string): Promise<void> {
 async function handleMessage({ message }: { message: any; }) {
     if (!message?.content || typeof message.content !== "string") return;
 
-    const userId = parseTrigger(message.content, message);
-    if (!userId) return;
+    const parsed = parseTrigger(message.content, message);
+    if (!parsed) return;
 
-    // Jangan petpet diri sendiri via bot (opsional — biarkan saja)
+    const { userId, isOutsideServer } = parsed;
+
     // Cek cooldown
     const cooldownMs = (settings.store.cooldownSeconds ?? 30) * 1000;
     const lastTime = cooldownMap.get(userId) ?? 0;
@@ -305,9 +386,10 @@ async function handleMessage({ message }: { message: any; }) {
     processingSet.add(processKey);
 
     try {
-        logger.info(`Generating petpet untuk user ${userId}...`);
+        logger.info(`Generating petpet untuk user ${userId}${isOutsideServer ? " (luar server)" : ""}...`);
 
-        // Ambil avatar URL user yang akan di-petpet
+        // Fetch user object — UserUtils.getUser bisa fetch user bahkan dari luar server
+        // karena dia hit Discord API: GET /users/:id
         let user: any;
         try {
             user = await UserUtils.getUser(userId);
@@ -316,31 +398,45 @@ async function handleMessage({ message }: { message: any; }) {
             return;
         }
 
-        // Ambil avatar URL (pakai guild avatar jika ada, fallback ke global)
-        const guildId = message.guild_id;
-        const avatarUrl = user
-            .getAvatarURL(guildId || undefined, 2048)
-            .replace(/\?size=\d+$/, "?size=2048");
+        if (!user) {
+            logger.error(`User ${userId} tidak ditemukan!`);
+            return;
+        }
+
+        // Bangun avatar URL:
+        // - Untuk user di server yang sama + setting useGuildAvatar aktif → pakai guild avatar
+        // - Untuk user luar server → lewati guildId (undefined) → dapat global CDN avatar
+        let avatarUrl: string;
+
+        if (isOutsideServer || !settings.store.useGuildAvatar) {
+            // Paksa global avatar — user mungkin tidak punya guild avatar di sini
+            avatarUrl = getAvatarUrlForUser(user, undefined);
+            logger.info(`Memakai global CDN avatar untuk ${user.username}: ${avatarUrl}`);
+        } else {
+            // Coba guild avatar dulu, fallback ke global otomatis oleh getAvatarURL
+            const guildId = message.guild_id || undefined;
+            avatarUrl = getAvatarUrlForUser(user, guildId);
+            logger.info(`Memakai avatar (guild=${guildId ?? "none"}) untuk ${user.username}: ${avatarUrl}`);
+        }
 
         // Generate GIF
         const gifFile = await generatePetpetGif(avatarUrl);
 
         // Tentukan channel tujuan
         const targetChannelId = resolveTargetChannel(message.channel_id);
-
         if (!targetChannelId) {
             logger.error("Channel tujuan tidak ditemukan!");
             return;
         }
 
-        // Set cooldown sebelum upload (untuk cegah race condition)
+        // Set cooldown sebelum upload
         cooldownMap.set(userId, Date.now());
 
-        // Auto-upload & kirim langsung tanpa popup
+        // Upload & kirim
         await autoSendPetpet(gifFile, targetChannelId);
 
         logger.info(
-            `Petpet GIF untuk user ${user.username} dikirim ke channel ${targetChannelId}!`
+            `Petpet GIF untuk ${user.username} (${userId}) dikirim ke channel ${targetChannelId}!`
         );
     } catch (err) {
         logger.error("Error saat generate petpet:", err);
@@ -354,9 +450,8 @@ async function handleMessage({ message }: { message: any; }) {
 export default definePlugin({
     name: "petpetOthers",
     description:
-        "Plugin fun: reply pesan seseorang lalu ketik \"!petpet @mention\" untuk " +
-        "generate petpet GIF dari avatar mereka dan kirim ke channel yang dikonfigurasi. " +
-        "Mendukung server/channel tujuan khusus agar tidak melanggar rules.",
+        "Plugin fun: ketik \"!petpet @mention\", \"!petpet ID\", atau \"!petpet username\" untuk " +
+        "generate petpet GIF dari avatar mereka. Mendukung user luar server via ID atau username!",
     tags: ["Fun", "Social"],
     authors: [{ name: "kintil555", id: 0n }],
 
