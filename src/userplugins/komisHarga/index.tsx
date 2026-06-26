@@ -9,7 +9,7 @@ import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import { sendMessage } from "@utils/discord";
 import definePlugin, { OptionType } from "@utils/types";
-import { AuthenticationStore, FluxDispatcher, PresenceStore, UserStore } from "@webpack/common";
+import { AuthenticationStore, ChannelStore, FluxDispatcher, PresenceStore, UserStore } from "@webpack/common";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -61,18 +61,25 @@ const settings = definePluginSettings({
     },
     triggerWord: {
         type: OptionType.STRING,
-        description: "Kata trigger untuk munculkan harga (default: !harga)",
+        description: "Kata trigger (default: !harga)",
         default: "!harga",
+    },
+    allowedUser1: {
+        type: OptionType.STRING,
+        description: "User ID orang pertama yang boleh trigger !harga via DM (kosongkan = semua DM)",
+        default: "",
+        placeholder: "123456789012345678",
+    },
+    allowedUser2: {
+        type: OptionType.STRING,
+        description: "User ID orang kedua yang boleh trigger !harga via DM (maks. 2 orang)",
+        default: "",
+        placeholder: "123456789012345678",
     },
     cooldownSeconds: {
         type: OptionType.NUMBER,
-        description: "Cooldown reply per channel (detik)",
+        description: "Cooldown reply per DM (detik)",
         default: 60,
-    },
-    replyOnlyWhenOnline: {
-        type: OptionType.BOOLEAN,
-        description: "Hanya reply saat kamu online/idle/dnd. Kalau offline, simpan & kirim saat login.",
-        default: true,
     },
 });
 
@@ -102,6 +109,27 @@ function getTrigger(): string {
 
 function hasTrigger(content: string): boolean {
     return content.trim().toLowerCase().startsWith(getTrigger());
+}
+
+/** Cek apakah channel adalah DM (type 1 = DM) */
+function isDMChannel(channelId: string): boolean {
+    const channel = ChannelStore.getChannel(channelId);
+    return channel?.type === 1;
+}
+
+/**
+ * Cek apakah sender diizinkan:
+ * - Kalau kedua allowedUser kosong → semua DM diizinkan
+ * - Kalau ada yang diisi → hanya user yang terdaftar
+ */
+function isSenderAllowed(senderId: string): boolean {
+    const u1 = settings.store.allowedUser1?.trim();
+    const u2 = settings.store.allowedUser2?.trim();
+
+    // Tidak ada yang dikonfigurasi → semua DM boleh
+    if (!u1 && !u2) return true;
+
+    return senderId === u1 || senderId === u2;
 }
 
 /** Simpan pending channels ke DataStore supaya survive restart */
@@ -151,21 +179,29 @@ async function handleMessage({ message }: { message: any; }) {
 
     const channelId: string = message.channel_id;
 
+    // Hanya proses pesan dari DM (bukan server)
+    if (!isDMChannel(channelId)) return;
+
+    // Cek apakah sender termasuk yang diizinkan
+    if (!isSenderAllowed(message.author.id)) {
+        logger.info(`User ${message.author.id} tidak ada di whitelist, skip.`);
+        return;
+    }
+
     // Cek cooldown
     const cooldownMs = (settings.store.cooldownSeconds ?? 60) * 1000;
     const lastSent = cooldownMap.get(channelId) ?? 0;
     if (Date.now() - lastSent < cooldownMs) {
-        logger.info(`Cooldown aktif di channel ${channelId}, skip.`);
+        logger.info(`Cooldown aktif di DM ${channelId}, skip.`);
         return;
     }
 
-    // Kalau settings replyOnlyWhenOnline aktif, cek status dulu
-    if (settings.store.replyOnlyWhenOnline && !isSelfOnline()) {
-        // User offline → simpan ke pending
+    // Kalau offline → simpan ke pending
+    if (!isSelfOnline()) {
         if (!pendingChannels.includes(channelId)) {
             pendingChannels.push(channelId);
             await savePending();
-            logger.info(`User offline, channel ${channelId} disimpan sebagai pending.`);
+            logger.info(`User offline, DM ${channelId} disimpan sebagai pending.`);
         }
         return;
     }
@@ -174,7 +210,7 @@ async function handleMessage({ message }: { message: any; }) {
     try {
         await sendMessage(channelId, { content: HARGA_MESSAGE });
         cooldownMap.set(channelId, Date.now());
-        logger.info(`Reply harga terkirim ke channel ${channelId}`);
+        logger.info(`Reply harga terkirim ke DM ${channelId}`);
     } catch (err) {
         logger.error("Gagal kirim reply harga:", err);
     }
@@ -196,7 +232,8 @@ async function handleConnectionOpen() {
 export default definePlugin({
     name: "komisHarga",
     description:
-        "Auto-reply harga komis thumbnail saat ada yang ketik !harga. " +
+        "Auto-reply harga komis thumbnail via DM saat ada yang ketik !harga. " +
+        "Khusus DM, bisa dibatasi maksimal 2 orang. " +
         "Hanya aktif saat kamu online. Kalau ada yang tanya saat offline, " +
         "pesannya disimpan dan otomatis dikirim 10 detik setelah kamu login.",
     tags: ["Fun", "Utility"],
