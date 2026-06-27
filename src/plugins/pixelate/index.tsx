@@ -166,11 +166,7 @@ function loadImageFromFile(file: File): Promise<HTMLImageElement> {
 async function pixelateImage(source: HTMLImageElement, blockSize: number): Promise<Blob> {
     const { width, height } = source;
 
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-
+    // Step 1: downsample ke ukuran kecil — smoothing ON biar dapat rata-rata warna per area
     const smallW = Math.max(1, Math.round(width / blockSize));
     const smallH = Math.max(1, Math.round(height / blockSize));
 
@@ -178,10 +174,17 @@ async function pixelateImage(source: HTMLImageElement, blockSize: number): Promi
     small.width = smallW;
     small.height = smallH;
     const smallCtx = small.getContext("2d", { willReadFrequently: true })!;
-    smallCtx.imageSmoothingEnabled = false;
+    smallCtx.imageSmoothingEnabled = true;
+    smallCtx.imageSmoothingQuality = "low";
     smallCtx.drawImage(source, 0, 0, smallW, smallH);
 
-    ctx.imageSmoothingEnabled = false;
+    // Step 2: upscale balik ke ukuran asli — smoothing ON → efek blur/mosaic burik
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "low";
     ctx.drawImage(small, 0, 0, smallW, smallH, 0, 0, width, height);
 
     const fmt = (settings.store.outputFormat as string) ?? "image/png";
