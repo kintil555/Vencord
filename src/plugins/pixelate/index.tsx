@@ -6,12 +6,13 @@
 
 import { ApplicationCommandInputType, ApplicationCommandOptionType, findOption, sendBotMessage } from "@api/Commands";
 import { definePluginSettings } from "@api/Settings";
+import { Devs } from "@utils/constants";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { CloudUpload as TCloudUpload, MessageAttachment } from "@vencord/discord-types";
 import { CloudUploadPlatform } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
-import { ChannelStore, Constants, FluxDispatcher, GuildStore, RestAPI, SnowflakeUtils } from "@webpack/common";
+import { ChannelStore, Constants, FluxDispatcher, GuildChannelStore, GuildStore, RestAPI, SearchableSelect, SnowflakeUtils, useState } from "@webpack/common";
 
 const CloudUpload: typeof TCloudUpload = findLazy(m => m.prototype?.trackUploadFinished);
 
@@ -19,18 +20,91 @@ const logger = new Logger("Pixelate", "#a78bfa");
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
+function GuildChannelPicker({ setValue, option }: any) {
+    const [selectedGuildId, setSelectedGuildId] = useState<string>(
+        () => {
+            try {
+                const stored = JSON.parse(settings.store.allowedGuildChannel ?? "{}");
+                return stored.guildId ?? "";
+            } catch { return ""; }
+        }
+    );
+    const [selectedChannelId, setSelectedChannelId] = useState<string>(
+        () => {
+            try {
+                const stored = JSON.parse(settings.store.allowedGuildChannel ?? "{}");
+                return stored.channelId ?? "";
+            } catch { return ""; }
+        }
+    );
+
+    const guilds = Object.values(GuildStore.getGuilds());
+    const guildOptions = [
+        { label: "— Semua server —", value: "" },
+        ...guilds.map(g => ({ label: g.name, value: g.id }))
+    ];
+
+    const channelOptions: { label: string; value: string; }[] = [{ label: "— Semua channel —", value: "" }];
+    if (selectedGuildId) {
+        const guildChannels = GuildChannelStore.getChannels(selectedGuildId);
+        const selectables = (guildChannels?.SELECTABLE ?? []) as Array<{ channel: { id: string; name: string; type: number; }; }>;
+        // Hanya text channel (type 0) dan announcement (type 5)
+        selectables
+            .filter(c => c.channel.type === 0 || c.channel.type === 5)
+            .forEach(c => channelOptions.push({ label: `# ${c.channel.name}`, value: c.channel.id }));
+    }
+
+    function commit(guildId: string, channelId: string) {
+        setValue(JSON.stringify({ guildId, channelId }));
+    }
+
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div>
+                <div style={{ marginBottom: 4, fontSize: 12, color: "var(--text-muted)" }}>Server</div>
+                <SearchableSelect
+                    options={guildOptions}
+                    value={selectedGuildId}
+                    placeholder="Pilih server..."
+                    clearable={false}
+                    onChange={(v: string) => {
+                        setSelectedGuildId(v);
+                        setSelectedChannelId("");
+                        commit(v, "");
+                    }}
+                />
+            </div>
+            <div>
+                <div style={{ marginBottom: 4, fontSize: 12, color: "var(--text-muted)" }}>Channel</div>
+                <SearchableSelect
+                    options={channelOptions}
+                    value={selectedChannelId}
+                    placeholder={selectedGuildId ? "Pilih channel..." : "Pilih server dulu"}
+                    clearable={false}
+                    isDisabled={!selectedGuildId}
+                    onChange={(v: string) => {
+                        setSelectedChannelId(v);
+                        commit(selectedGuildId, v);
+                    }}
+                />
+            </div>
+            {(selectedGuildId || selectedChannelId) && (
+                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    {selectedGuildId
+                        ? `✅ Dibatasi ke: ${GuildStore.getGuild(selectedGuildId)?.name ?? selectedGuildId}${selectedChannelId ? ` → #${ChannelStore.getChannel(selectedChannelId)?.name ?? selectedChannelId}` : " (semua channel)"}`
+                        : "Berlaku di semua server & channel"}
+                </div>
+            )}
+        </div>
+    );
+}
+
 const settings = definePluginSettings({
-    allowedGuildId: {
-        type: OptionType.STRING,
-        description: "ID Server yang boleh pakai !pixel (kosongkan = semua server)",
-        default: "",
-        placeholder: "123456789012345678",
-    },
-    allowedChannelId: {
-        type: OptionType.STRING,
-        description: "ID Channel yang boleh pakai !pixel (kosongkan = semua channel)",
-        default: "",
-        placeholder: "123456789012345678",
+    allowedGuildChannel: {
+        type: OptionType.COMPONENT,
+        description: "Server & Channel yang boleh pakai !pixel",
+        default: "{}",
+        component: GuildChannelPicker,
     },
     blockSize: {
         type: OptionType.SLIDER,
@@ -57,7 +131,7 @@ const settings = definePluginSettings({
     },
     cooldownSeconds: {
         type: OptionType.NUMBER,
-        description: "Cooldown antar !pixel (detik) untuk mencegah spam",
+        description: "Cooldown antar !pixel per user (detik)",
         default: 10,
     },
 });
@@ -97,7 +171,6 @@ async function pixelateImage(source: HTMLImageElement, blockSize: number): Promi
     canvas.height = height;
     const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
 
-    // Downsample ke ukuran kecil
     const smallW = Math.max(1, Math.round(width / blockSize));
     const smallH = Math.max(1, Math.round(height / blockSize));
 
@@ -108,7 +181,6 @@ async function pixelateImage(source: HTMLImageElement, blockSize: number): Promi
     smallCtx.imageSmoothingEnabled = false;
     smallCtx.drawImage(source, 0, 0, smallW, smallH);
 
-    // Upscale balik tanpa smoothing → efek kotak
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(small, 0, 0, smallW, smallH, 0, 0, width, height);
 
@@ -135,7 +207,7 @@ function blobToFile(blob: Blob, originalName: string): File {
     return new File([blob], `${base}_pixel${ext}`, { type: fmt });
 }
 
-// ─── Upload & Kirim ───────────────────────────────────────────────────────────
+// ─── Upload & Kirim dengan reply ──────────────────────────────────────────────
 
 function uploadAndSend(file: File, channelId: string, replyToMessageId?: string): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -159,16 +231,12 @@ function uploadAndSend(file: File, channelId: string, replyToMessageId?: string)
                 }],
             };
 
-            // Kalau ada reply target, tambahkan message_reference
             if (replyToMessageId) {
                 body.message_reference = {
                     message_id: replyToMessageId,
                     channel_id: channelId,
                 };
-                body.allowed_mentions = {
-                    parse: [],
-                    replied_user: true,
-                };
+                body.allowed_mentions = { parse: [], replied_user: true };
             }
 
             RestAPI.post({
@@ -177,27 +245,27 @@ function uploadAndSend(file: File, channelId: string, replyToMessageId?: string)
             }).then(() => resolve()).catch(reject);
         });
 
-        upload.on("error", () => {
-            reject(new Error("Upload gagal"));
-        });
-
+        upload.on("error", () => reject(new Error("Upload gagal")));
         upload.upload();
     });
 }
 
-// ─── Channel / Guild Guard ────────────────────────────────────────────────────
+// ─── Guard: cek apakah channel/server diizinkan ───────────────────────────────
 
 function isAllowed(guildId: string | null | undefined, channelId: string): boolean {
-    const allowedGuild = settings.store.allowedGuildId?.trim();
-    const allowedChannel = settings.store.allowedChannelId?.trim();
+    try {
+        const stored = JSON.parse(settings.store.allowedGuildChannel ?? "{}");
+        const allowedGuild: string = stored.guildId ?? "";
+        const allowedChannel: string = stored.channelId ?? "";
 
-    if (allowedGuild && guildId !== allowedGuild) return false;
-    if (allowedChannel && channelId !== allowedChannel) return false;
+        if (allowedGuild && guildId !== allowedGuild) return false;
+        if (allowedChannel && channelId !== allowedChannel) return false;
+    } catch { /* jika parse gagal, izinkan semua */ }
 
     return true;
 }
 
-// ─── Cari attachment gambar dari pesan ────────────────────────────────────────
+// ─── Cari attachment gambar dari array attachments ────────────────────────────
 
 function findImageAttachment(attachments: MessageAttachment[]): MessageAttachment | null {
     if (!attachments?.length) return null;
@@ -216,19 +284,16 @@ async function handleMessage({ message }: { message: any; }) {
     const channelId: string = message.channel_id;
     const guildId: string | null = message.guild_id ?? null;
 
-    // Guard: hanya channel/server yang diizinkan
     if (!isAllowed(guildId, channelId)) return;
 
-    // Cooldown per user
     const userId: string = message.author?.id;
     const cooldownMs = (settings.store.cooldownSeconds ?? 10) * 1000;
     const lastUsed = cooldownMap.get(userId) ?? 0;
     if (Date.now() - lastUsed < cooldownMs) {
-        logger.info(`Cooldown aktif untuk ${userId}, skip.`);
+        logger.info(`Cooldown aktif untuk ${userId}`);
         return;
     }
 
-    // Cegah double processing
     const key = `${channelId}:${message.id}`;
     if (processingSet.has(key)) return;
     processingSet.add(key);
@@ -237,26 +302,21 @@ async function handleMessage({ message }: { message: any; }) {
         let imgAttachment: MessageAttachment | null = null;
         let replyToMessageId: string | undefined;
 
-        // === Kasus 1: user reply ke pesan orang lain yang punya gambar ===
+        // Kasus 1: reply ke pesan orang lain yang ada gambarnya
         const refMsg = message.referenced_message;
         if (refMsg) {
             imgAttachment = findImageAttachment(refMsg.attachments ?? []);
-            if (imgAttachment) {
-                // Kita akan reply ke pesan si pengirim !pixel (orang yang minta)
-                replyToMessageId = message.id;
-            }
+            if (imgAttachment) replyToMessageId = message.id;
         }
 
-        // === Kasus 2: user kirim gambar sendiri + !pixel ===
+        // Kasus 2: kirim gambar sendiri + !pixel
         if (!imgAttachment) {
             imgAttachment = findImageAttachment(message.attachments ?? []);
-            if (imgAttachment) {
-                replyToMessageId = message.id;
-            }
+            if (imgAttachment) replyToMessageId = message.id;
         }
 
         if (!imgAttachment) {
-            logger.info("!pixel dipanggil tapi tidak ada gambar ditemukan.");
+            logger.info("!pixel: tidak ada gambar ditemukan");
             return;
         }
 
@@ -264,7 +324,6 @@ async function handleMessage({ message }: { message: any; }) {
         const imageUrl = imgAttachment.proxy_url || imgAttachment.url;
 
         logger.info(`Pixelating: ${imgAttachment.filename} (block: ${blockSize})`);
-
         cooldownMap.set(userId, Date.now());
 
         const img = await loadImageFromUrl(imageUrl);
@@ -272,8 +331,7 @@ async function handleMessage({ message }: { message: any; }) {
         const file = blobToFile(blob, imgAttachment.filename);
 
         await uploadAndSend(file, channelId, replyToMessageId);
-
-        logger.info(`Pixelated ${imgAttachment.filename} dikirim ke ${channelId}`);
+        logger.info(`Dikirim ke ${channelId}`);
     } catch (err) {
         logger.error("Error saat pixelate:", err);
     } finally {
@@ -283,14 +341,10 @@ async function handleMessage({ message }: { message: any; }) {
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
-function loadImageFromFileForCmd(file: File): Promise<HTMLImageElement> {
-    return loadImageFromFile(file);
-}
-
 export default definePlugin({
     name: "Pixelate",
-    description: "Bikin gambar jadi burik. Pakai /pixelate untuk gambar sendiri, atau ketik !pixel sambil reply/attach gambar biar otomatis diproses dan dikirim balik.",
-    authors: [{ name: "kintil555", id: 0n }],
+    description: "Bikin gambar jadi burik. Ketik !pixel sambil reply/attach gambar → otomatis diproses & dikirim balik. Atau pakai /pixelate untuk diri sendiri.",
+    authors: [Devs.kintil555],
     tags: ["fun", "image", "pixelate", "mosaic"],
     settings,
 
@@ -346,7 +400,7 @@ export default definePlugin({
 
                 try {
                     const file = upload.item.file;
-                    const img = await loadImageFromFileForCmd(file);
+                    const img = await loadImageFromFile(file);
                     const blob = await pixelateImage(img, blockSize);
                     const result = blobToFile(blob, file.name);
 
@@ -354,7 +408,7 @@ export default definePlugin({
                         UploadHandler.promptToUpload([result], ctx.channel, DraftType.ChannelMessage);
                     }, 10);
                 } catch (e: any) {
-                    logger.error("Slash command pixelate error:", e);
+                    logger.error("Slash command error:", e);
                     sendBotMessage(ctx.channel.id, { content: `❌ Gagal: ${e?.message ?? "Unknown error"}` });
                 }
             },
