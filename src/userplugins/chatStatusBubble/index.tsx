@@ -6,37 +6,41 @@
 
 import "./style.css";
 
-import { addMessageDecoration, removeMessageDecoration } from "@api/MessageDecorations";
+import ErrorBoundary from "@components/ErrorBoundary";
 import { definePluginSettings } from "@api/Settings";
-import { Devs } from "@utils/constants";
+import { classes } from "@utils/misc";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { Activity } from "@vencord/discord-types";
 import { ActivityType } from "@vencord/discord-types/enums";
-import { IconUtils, PresenceStore, Tooltip, useStateFromStores } from "@webpack/common";
+import { findCssClassesLazy } from "@webpack";
+import { IconUtils, Message, PresenceStore, Tooltip, useStateFromStores } from "@webpack/common";
 
 const logger = new Logger("ChatStatusBubble", "#fcd34d");
 
+const TimestampClasses = findCssClassesLazy("timestampInline", "timestamp");
+
 const settings = definePluginSettings({
-    onlyOnHover: {
-        type: OptionType.BOOLEAN,
-        description: "Tampilkan bubble status hanya saat kursor di atas nama/avatar (selalu menyiapkan ikon kecil di sebelah nama)",
-        default: true,
-    },
     showEmoji: {
         type: OptionType.BOOLEAN,
-        description: "Tampilkan emoji custom status di dalam bubble",
+        description: "Tampilkan emoji custom status",
         default: true,
     },
-    compactDot: {
+    showTextStatus: {
         type: OptionType.BOOLEAN,
-        description: "Tampilkan ikon 💭 kecil di sebelah nama pengirim ketika dia punya custom status",
+        description: "Tampilkan teks custom status (jika ada) di tooltip",
         default: true,
     },
 });
 
 function getCustomStatus(userId: string): Activity | undefined {
-    return PresenceStore.getActivities(userId).find(a => a.type === ActivityType.CUSTOM_STATUS);
+    try {
+        const acts = PresenceStore.getActivities(userId);
+        return acts?.find(a => a.type === ActivityType.CUSTOM_STATUS);
+    } catch (e) {
+        logger.error("getCustomStatus error:", e);
+        return undefined;
+    }
 }
 
 function StatusEmoji({ activity }: { activity: Activity; }) {
@@ -44,81 +48,103 @@ function StatusEmoji({ activity }: { activity: Activity; }) {
 
     const { id, name, animated } = activity.emoji;
 
-    // Emoji custom Discord (punya id) vs emoji unicode bawaan (tidak punya id)
     if (id) {
-        const url = IconUtils.getEmojiURL({ id, animated, size: 20 });
+        // Emoji custom Discord (punya id) — pastikan id ada sebelum kirim ke getEmojiURL
+        const url = IconUtils.getEmojiURL({ id, animated: animated ?? false, size: 20 });
         return (
             <img
                 className="vc-csb-emoji"
                 src={url}
-                alt={name}
+                alt={name ?? "emoji"}
                 draggable={false}
             />
         );
     }
 
-    return <span className="vc-csb-emoji vc-csb-emoji-unicode">{name}</span>;
+    // Emoji unicode bawaan (tidak punya id)
+    if (name) {
+        return <span className="vc-csb-emoji vc-csb-emoji-unicode">{name}</span>;
+    }
+
+    return null;
 }
 
-function StatusBubbleContent({ activity }: { activity: Activity; }) {
+function TooltipContent({ activity }: { activity: Activity; }) {
     return (
-        <div className="vc-csb-bubble">
+        <div className="vc-csb-tooltip-content">
             <StatusEmoji activity={activity} />
-            <span className="vc-csb-text">{activity.state}</span>
+            {settings.store.showTextStatus && activity.state && (
+                <span className="vc-csb-text">{activity.state}</span>
+            )}
         </div>
     );
 }
 
-function ChatStatusIndicator({ userId }: { userId: string; }) {
+function StatusBubble({ userId }: { userId: string; }) {
     const activity = useStateFromStores(
         [PresenceStore],
         () => getCustomStatus(userId),
         [userId],
-        (a, b) => a?.state === b?.state && a?.emoji?.id === b?.emoji?.id && a?.emoji?.name === b?.emoji?.name
+        (a, b) => {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+            return (
+                a.state === b.state &&
+                a.emoji?.id === b.emoji?.id &&
+                a.emoji?.name === b.emoji?.name
+            );
+        }
     );
 
-    if (activity == null || !activity.state) return null;
+    // Tampilkan bubble hanya jika ada emoji ATAU teks status
+    if (activity == null) return null;
+    const hasContent = activity.emoji != null || (activity.state != null && activity.state.length > 0);
+    if (!hasContent) return null;
 
-    // Mode "selalu tampil" — bubble langsung muncul tanpa perlu hover terpisah,
-    // karena ikonnya sendiri sudah jadi trigger Tooltip saat dihover.
     return (
-        <Tooltip text={<StatusBubbleContent activity={activity} />}>
+        <Tooltip text={<TooltipContent activity={activity} />}>
             {tooltipProps => (
-                settings.store.compactDot ? (
-                    <span
-                        {...tooltipProps}
-                        className="vc-csb-icon"
-                        aria-label="Status pengguna"
-                    >
-                        💭
-                    </span>
-                ) : (
-                    // Tetap render span tak terlihat agar Tooltip tetap bisa
-                    // dipasang ke seluruh blok nama lewat CSS, lihat style.css
-                    <span {...tooltipProps} className="vc-csb-icon vc-csb-icon-hidden" />
-                )
+                <span
+                    {...tooltipProps}
+                    className={classes(
+                        "vc-csb-bubble-icon",
+                        TimestampClasses.timestampInline,
+                        TimestampClasses.timestamp
+                    )}
+                    aria-label="Custom status"
+                >
+                    💭
+                </span>
             )}
         </Tooltip>
     );
 }
 
+const StatusBubbleWrapper = ErrorBoundary.wrap(
+    ({ message }: { message: Message; }) => {
+        const userId = message?.author?.id;
+        if (userId == null || message?.author?.bot) return null;
+        return <StatusBubble userId={userId} />;
+    },
+    { noop: true }
+);
+
 export default definePlugin({
     name: "ChatStatusBubble",
-    description: "Menampilkan custom status seseorang (mis. 💭 Hari ini kerja) sebagai bubble saat kursor diarahkan ke nama/avatar mereka di chat, tanpa perlu membuka profilnya.",
+    description: "Menampilkan custom status seseorang sebagai bubble 💭 di sebelah nama mereka di chat, muncul ketika kursor diarahkan ke ikon tersebut.",
     authors: [{ name: "kintil555", id: 0n }],
     settings,
 
-    dependencies: ["MessageDecorationsAPI"],
+    patches: [
+        {
+            // Patch area header pesan (nama + timestamp) — sama seperti userMessagesPronouns
+            find: "showCommunicationDisabledStyles",
+            replacement: {
+                match: /(?<=return\s*\(0,\i\.jsxs?\)\(.+!\i&&)(\(0,\i.jsxs?\)\(.+?\{.+?\}\))/,
+                replace: "[$1, $self.StatusBubbleWrapper(arguments[0])]"
+            }
+        }
+    ],
 
-    start() {
-        addMessageDecoration("ChatStatusBubble", props => {
-            const userId = props?.message?.author?.id;
-            if (userId == null) return null;
-            return <ChatStatusIndicator userId={userId} />;
-        });
-    },
-
-    stop() {
-        removeMessageDecoration("ChatStatusBubble");
-    },
+    StatusBubbleWrapper,
 });
