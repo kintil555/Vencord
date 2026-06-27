@@ -320,7 +320,13 @@ async function handleMessage({ message }: { message: any; }) {
             return;
         }
 
-        const blockSize = settings.store.blockSize ?? 16;
+        // Parse block size dari konten: "!pixel 4" → 4, "!pixel" → default settings
+        const afterCmd = content.slice("!pixel".length).trim();
+        const parsed = parseInt(afterCmd, 10);
+        const blockSize = (!isNaN(parsed) && parsed >= 2 && parsed <= 256)
+            ? parsed
+            : (settings.store.blockSize ?? 16);
+
         const imageUrl = imgAttachment.proxy_url || imgAttachment.url;
 
         logger.info(`Pixelating: ${imgAttachment.filename} (block: ${blockSize})`);
